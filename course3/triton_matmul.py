@@ -91,24 +91,34 @@ def _fused_linear_kernel_fwd(
         BLOCK_SIZE_N: tl.constexpr = 128,
         BLOCK_SIZE_K: tl.constexpr = 64,
 ):
+    # 对于每个triton block的二维坐标
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-
+    # 一个triton block的处理范围（在M,N轴上)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[:, None]
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[None, :]  # 形状为 (1, BLOCK_SIZE_N)。
 
     z = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # 在k轴上进行一个分块归约
     for k in range(0, K, BLOCK_SIZE_K):
         x_k = tl.arange(0, BLOCK_SIZE_K)[None, :] + k
+        # tl.load()加载了一个块
+        # 加载的是一个范围(offs_m，xk)
+
+        # x_k = tl.arange(0, BLOCK_SIZE_K)[None, :] + k k是现在处理块的一个起始地址，
+        # 加一个范围表示当前在k轴上的处理范围
+        # k等于8的时候，tl.arange(0, BLOCK_SIZE_K)[None, :] 表示0,4，两者相加就表示(8,12)的这么一个范围值
+
         x = tl.load(x_ptr + offs_m * K + x_k, mask=(offs_m < M) & (x_k < K), other=0.0)
         x = x.to(tl.float16)
 
         w_k = tl.arange(0, BLOCK_SIZE_K)[:, None] + k
+        # tl.load加载的是(w_k,offs_n)
         w = tl.load(w_ptr + w_k * N + offs_n, mask=(w_k < K) & (offs_n < N), other=0.0)
         w = w.to(tl.float16)
-
+        # z += x@w
         z = tl.dot(x, w, acc=z)
-
+    # 一个triton block计算的结果大小是block_m×block_n
     z_offset = offs_m * N + offs_n
     z_mask = (offs_m < M) & (offs_n < N)
 
@@ -134,6 +144,7 @@ def fused_ffn(
     BLOCK_SIZE_K = 32
 
     # 2D launch kernel where each block gets its own program.
+    # 配置网格中（二维），每个维度上的triton block数量
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N), 1)
     _fused_linear_kernel_fwd[grid](
         x,
@@ -173,20 +184,21 @@ if __name__ == '__main__':
         # 重新生成输入
         x = torch.randn((batch_size, sequence_length, hidden_dim), device='cuda', dtype=torch.float16)
         weight = torch.randn((hidden_dim, output_dim), device='cuda', dtype=torch.float16)
+        torch.cuda.synchronize()
 
         t1 = time.time()
         output = fused_ffn(x, weight)
+        torch.cuda.synchronize()
         t2 = time.time()
-        # print('triton time:{}'.format(t2 - t1))
+        print('triton time:{}'.format(t2 - t1))
         times_triton.append(t2 - t1)
 
         t1 = time.time()
         golden = x@weight
+        torch.cuda.synchronize()
         t2 = time.time()
         times_torch.append(t2-t1)
         print('pytorch time:{}'.format(t2 - t1))
-        print(output.shape)  
-        print(golden.shape)
 
     import matplotlib.pyplot as plt
 
